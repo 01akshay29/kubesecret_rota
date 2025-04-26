@@ -1,0 +1,29 @@
+replicaCount: 1
+
+image:
+  repository: your-dockerhub-username/secret-watcher
+  tag: latest
+  pullPolicy: IfNotPresent
+
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  name: ""
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 128Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+tolerations:
+  - key: "node-role.kubernetes.io/control-plane"
+    effect: NoSchedule
+
+nodeSelector: {}
+
+affinity: {}
