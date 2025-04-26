@@ -7,119 +7,169 @@ import (
 	"strings"
 	"time"
 
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
+	v1 "k8s.io/api/core/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/informers"
-	"k8s.io/apimachinery/pkg/util/retry"
-	"k8s.io/apimachinery/pkg/types"
+	kubernetes "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/retry"
+)
+
+const (
+	ExpiryAnnotationKey = "secret-expiry" // Customize as needed
+	PollInterval        = 5 * time.Minute // Polling interval
 )
 
 func main() {
-	config, err := rest.InClusterConfig()
+	clientset, err := getClient()
 	if err != nil {
-		panic(err.Error())
-	}
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		panic(err.Error())
+		panic(err)
 	}
 
-	factory := informers.NewSharedInformerFactory(clientset, time.Minute*10)
-	secretInformer := factory.Core().V1().Secrets().Informer()
+	ticker := time.NewTicker(PollInterval)
+	defer ticker.Stop()
 
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-
-	secretInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    handleSecret,
-		UpdateFunc: func(oldObj, newObj interface{}) { handleSecret(newObj) },
-	})
-
-	factory.Start(stopCh)
-
-	<-stopCh
+	for {
+		select {
+		case <-ticker.C:
+			err := checkSecrets(clientset)
+			if err != nil {
+				fmt.Println("Error checking secrets:", err)
+			}
+		}
+	}
 }
 
-func handleSecret(obj interface{}) {
-	secret, ok := obj.(*metav1.Secret)
-	if !ok {
-		fmt.Println("could not parse secret")
-		return
-	}
-
-	expiryAnnotation := secret.Annotations["secret-watcher.expiry"]
-	if expiryAnnotation == "" {
-		return
-	}
-
-	expiryTime, err := parseExpiry(expiryAnnotation)
+// Get Kubernetes clientset
+func getClient() (*kubernetes.Clientset, error) {
+	// Inside cluster config
+	config, err := rest.InClusterConfig()
 	if err != nil {
-		fmt.Printf("could not parse expiry: %v\n", err)
-		return
+		// fallback to kubeconfig (for local debug)
+		kubeconfig := os.Getenv("KUBECONFIG")
+		if kubeconfig == "" {
+			return nil, fmt.Errorf("cannot create in-cluster config and no KUBECONFIG provided")
+		}
+		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return kubernetes.NewForConfig(config)
+}
+
+// Main secret checker
+func checkSecrets(clientset *kubernetes.Clientset) error {
+	secrets, err := clientset.CoreV1().Secrets("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list secrets: %v", err)
 	}
 
-	if time.Now().After(expiryTime) {
-		fmt.Printf("Secret %s/%s expired!\n", secret.Namespace, secret.Name)
-		clientset, _ := kubernetes.NewForConfigOrDie(rest.InClusterConfig())
+	now := time.Now()
 
-		// Find all pods using this secret
-		pods, err := clientset.CoreV1().Pods(secret.Namespace).List(context.Background(), metav1.ListOptions{})
-		if err != nil {
-			fmt.Printf("error listing pods: %v\n", err)
-			return
+	for _, secret := range secrets.Items {
+		expiryRaw, ok := secret.Annotations[ExpiryAnnotationKey]
+		if !ok {
+			continue
 		}
 
-		for _, pod := range pods.Items {
-			for _, volume := range pod.Spec.Volumes {
-				if volume.Secret != nil && volume.Secret.SecretName == secret.Name {
-					// Restart the deployment
-					restartPodOwner(clientset, &pod)
-					break
+		expired, err := isSecretExpired(secret, expiryRaw, now)
+		if err != nil {
+			fmt.Printf("Invalid expiry for secret %s/%s: %v\n", secret.Namespace, secret.Name, err)
+			continue
+		}
+
+		if expired {
+			fmt.Printf("Secret expired: %s/%s\n", secret.Namespace, secret.Name)
+			err := handleExpiredSecret(clientset, secret)
+			if err != nil {
+				fmt.Printf("Error handling expired secret %s/%s: %v\n", secret.Namespace, secret.Name, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// Expiry checker
+func isSecretExpired(secret v1.Secret, expiryRaw string, now time.Time) (bool, error) {
+	// Try parse as absolute time (preferred)
+	layouts := []string{time.RFC3339, "2006-01-02T15:04:05", "2006-01-02"}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, expiryRaw); err == nil {
+			return now.After(t), nil
+		}
+	}
+
+	// Try parse as relative seconds since creation
+	if secs, err := time.ParseDuration(expiryRaw + "s"); err == nil {
+		created := secret.GetCreationTimestamp().Time
+		expiry := created.Add(secs)
+		return now.After(expiry), nil
+	}
+
+	return false, fmt.Errorf("unknown expiry format: %s", expiryRaw)
+}
+
+// Handle expired secret
+func handleExpiredSecret(clientset *kubernetes.Clientset, secret v1.Secret) error {
+	pods, err := clientset.CoreV1().Pods(secret.Namespace).List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("error listing pods: %v", err)
+	}
+
+	affectedDeployments := map[string]bool{}
+
+	for _, pod := range pods.Items {
+		if podUsesSecret(&pod, secret.Name) {
+			for _, owner := range pod.OwnerReferences {
+				if owner.Kind == "ReplicaSet" && owner.Controller != nil && *owner.Controller {
+					rsName := owner.Name
+					deploymentName := extractDeploymentName(rsName)
+					if deploymentName != "" {
+						affectedDeployments[deploymentName] = true
+					}
 				}
 			}
 		}
 	}
-}
 
-func parseExpiry(annotation string) (time.Time, error) {
-	// Try RFC3339
-	if t, err := time.Parse(time.RFC3339, annotation); err == nil {
-		return t, nil
-	}
-	// Try UNIX timestamp (seconds)
-	if seconds, err := time.ParseDuration(annotation + "s"); err == nil {
-		return time.Now().Add(seconds * -1), nil
-	}
-	return time.Time{}, fmt.Errorf("unsupported expiry format")
-}
-
-func restartPodOwner(clientset *kubernetes.Clientset, pod *metav1.Pod) {
-	for _, owner := range pod.OwnerReferences {
-		if *owner.Controller && strings.ToLower(owner.Kind) == "replicaset" {
-			rs, err := clientset.AppsV1().ReplicaSets(pod.Namespace).Get(context.Background(), owner.Name, metav1.GetOptions{})
-			if err != nil {
-				fmt.Printf("error getting replicaset: %v\n", err)
-				continue
-			}
-
-			depName := rs.OwnerReferences[0].Name
-			fmt.Printf("Restarting Deployment %s for pod %s\n", depName, pod.Name)
-			err = rolloutRestartDeployment(clientset, pod.Namespace, depName)
-			if err != nil {
-				fmt.Printf("failed to restart deployment: %v\n", err)
-			}
+	for dep := range affectedDeployments {
+		fmt.Printf("Restarting deployment %s/%s\n", secret.Namespace, dep)
+		err := rolloutRestartDeployment(clientset, secret.Namespace, dep)
+		if err != nil {
+			fmt.Printf("Failed to restart %s/%s: %v\n", secret.Namespace, dep, err)
 		}
 	}
+
+	return nil
 }
 
-func rolloutRestartDeployment(clientset *kubernetes.Clientset, namespace, deploymentName string) error {
-	depClient := clientset.AppsV1().Deployments(namespace)
-	ctx := context.Background()
+// Detect if a pod uses a secret
+func podUsesSecret(pod *v1.Pod, secretName string) bool {
+	for _, vol := range pod.Spec.Volumes {
+		if vol.Secret != nil && vol.Secret.SecretName == secretName {
+			return true
+		}
+	}
+	return false
+}
 
+// Extract Deployment name from ReplicaSet name
+func extractDeploymentName(rsName string) string {
+	parts := strings.Split(rsName, "-")
+	if len(parts) < 2 {
+		return ""
+	}
+	return strings.Join(parts[:len(parts)-1], "-")
+}
+
+// Rollout restart a deployment
+func rolloutRestartDeployment(clientset *kubernetes.Clientset, namespace, deploymentName string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		dep, err := depClient.Get(ctx, deploymentName, metav1.GetOptions{})
+		depClient := clientset.AppsV1().Deployments(namespace)
+		dep, err := depClient.Get(context.Background(), deploymentName, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -129,7 +179,7 @@ func rolloutRestartDeployment(clientset *kubernetes.Clientset, namespace, deploy
 		}
 		dep.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339)
 
-		_, err = depClient.Update(ctx, dep, metav1.UpdateOptions{})
+		_, err = depClient.Update(context.Background(), dep, metav1.UpdateOptions{})
 		return err
 	})
 }
