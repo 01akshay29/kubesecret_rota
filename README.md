@@ -1,0 +1,1 @@
+# kubesecret_rota
