@@ -1,8 +1,10 @@
 FROM golang:1.24 AS builder
 WORKDIR /app
 COPY . .
-RUN go mod tidy && go build -o secret-checker
+RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -o secret-checker
 
-FROM gcr.io/distroless/static:nonroot
-COPY --from=builder /app/secret-checker /
-ENTRYPOINT ["/secret-checker"]
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+COPY --from=builder /app/secret-checker ./
+CMD ["./secret-checker"]
