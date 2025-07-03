@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "secret-rotator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "secret-rotator.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    logLevel: {{ .Values.config.logLevel }}
+    metricsPort: {{ .Values.config.metricsPort }}
+    checkInterval: {{ .Values.config.checkInterval }}
+    dryRun: {{ .Values.config.dryRun }}
+    {{- if .Values.config.watchNamespaces }}
+    watchNamespaces:
+      {{- range .Values.config.watchNamespaces }}
+      - {{ . }}
+      {{- end }}
+    {{- end }}

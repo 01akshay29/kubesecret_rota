@@ -13,18 +13,20 @@ import (
 	kubernetes "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/util/retry"
 )
 
 const (
-	ExpiryAnnotationKey = "secret-expiry" // Customize as needed
-	PollInterval        = 5 * time.Minute // Polling interval
+	ExpiryAnnotationKey = "secret-expiry"
+	PollInterval        = 15 * time.Second // shorter interval for easier testing
 )
 
 func main() {
+	fmt.Println("Secret checker started...")
+
 	clientset, err := getClient()
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "Failed to create Kubernetes client: %v\n", err)
+		os.Exit(1)
 	}
 
 	ticker := time.NewTicker(PollInterval)
@@ -35,18 +37,15 @@ func main() {
 		case <-ticker.C:
 			err := checkSecrets(clientset)
 			if err != nil {
-				fmt.Println("Error checking secrets:", err)
+				fmt.Fprintf(os.Stderr, "Error checking secrets: %v\n", err)
 			}
 		}
 	}
 }
 
-// Get Kubernetes clientset
 func getClient() (*kubernetes.Clientset, error) {
-	// Inside cluster config
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		// fallback to kubeconfig (for local debug)
 		kubeconfig := os.Getenv("KUBECONFIG")
 		if kubeconfig == "" {
 			return nil, fmt.Errorf("cannot create in-cluster config and no KUBECONFIG provided")
@@ -59,14 +58,11 @@ func getClient() (*kubernetes.Clientset, error) {
 	return kubernetes.NewForConfig(config)
 }
 
-// Main secret checker
 func checkSecrets(clientset *kubernetes.Clientset) error {
 	secrets, err := clientset.CoreV1().Secrets("").List(context.Background(), metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to list secrets: %v", err)
+		return fmt.Errorf("failed to list secrets: %w", err)
 	}
-
-	now := time.Now()
 
 	for _, secret := range secrets.Items {
 		expiryRaw, ok := secret.Annotations[ExpiryAnnotationKey]
@@ -74,79 +70,103 @@ func checkSecrets(clientset *kubernetes.Clientset) error {
 			continue
 		}
 
-		expired, err := isSecretExpired(secret, expiryRaw, now)
-		if err != nil {
-			fmt.Printf("Invalid expiry for secret %s/%s: %v\n", secret.Namespace, secret.Name, err)
-			continue
-		}
+		// Print in previous format
+		fmt.Printf("Secret: %s/%s, Expiry: %s\n", secret.Namespace, secret.Name, expiryRaw)
 
-		if expired {
-			fmt.Printf("Secret expired: %s/%s\n", secret.Namespace, secret.Name)
-			err := handleExpiredSecret(clientset, secret)
-			if err != nil {
-				fmt.Printf("Error handling expired secret %s/%s: %v\n", secret.Namespace, secret.Name, err)
-			}
+		err := printResourcesUsingSecret(clientset, secret)
+		if err != nil {
+			fmt.Printf("  Error listing resources using secret: %v\n", err)
 		}
+		fmt.Println()
 	}
 
 	return nil
 }
 
-// Expiry checker
-func isSecretExpired(secret v1.Secret, expiryRaw string, now time.Time) (bool, error) {
-	// Try parse as absolute time (preferred)
-	layouts := []string{time.RFC3339, "2006-01-02T15:04:05", "2006-01-02"}
-	for _, layout := range layouts {
-		if t, err := time.Parse(layout, expiryRaw); err == nil {
-			return now.After(t), nil
-		}
-	}
+func printResourcesUsingSecret(clientset *kubernetes.Clientset, secret v1.Secret) error {
+	deployments := map[string]bool{}
+	replicaSets := map[string]bool{}
+	daemonSets := map[string]bool{}
 
-	// Try parse as relative seconds since creation
-	if secs, err := time.ParseDuration(expiryRaw + "s"); err == nil {
-		created := secret.GetCreationTimestamp().Time
-		expiry := created.Add(secs)
-		return now.After(expiry), nil
-	}
-
-	return false, fmt.Errorf("unknown expiry format: %s", expiryRaw)
-}
-
-// Handle expired secret
-func handleExpiredSecret(clientset *kubernetes.Clientset, secret v1.Secret) error {
 	pods, err := clientset.CoreV1().Pods(secret.Namespace).List(context.Background(), metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("error listing pods: %v", err)
+		return fmt.Errorf("error listing pods: %w", err)
 	}
-
-	affectedDeployments := map[string]bool{}
 
 	for _, pod := range pods.Items {
 		if podUsesSecret(&pod, secret.Name) {
 			for _, owner := range pod.OwnerReferences {
-				if owner.Kind == "ReplicaSet" && owner.Controller != nil && *owner.Controller {
+				if owner.Controller == nil || !*owner.Controller {
+					continue
+				}
+
+				switch owner.Kind {
+				case "ReplicaSet":
 					rsName := owner.Name
-					deploymentName := extractDeploymentName(rsName)
-					if deploymentName != "" {
-						affectedDeployments[deploymentName] = true
+					replicaSets[rsName] = true
+					depName := extractDeploymentName(rsName)
+					if depName != "" {
+						deployments[depName] = true
 					}
+				case "DaemonSet":
+					daemonSets[owner.Name] = true
+				case "Deployment":
+					deployments[owner.Name] = true
 				}
 			}
 		}
 	}
 
-	for dep := range affectedDeployments {
-		fmt.Printf("Restarting deployment %s/%s\n", secret.Namespace, dep)
-		err := rolloutRestartDeployment(clientset, secret.Namespace, dep)
-		if err != nil {
-			fmt.Printf("Failed to restart %s/%s: %v\n", secret.Namespace, dep, err)
+	rsList, err := clientset.AppsV1().ReplicaSets(secret.Namespace).List(context.Background(), metav1.ListOptions{})
+	if err == nil {
+		for _, rs := range rsList.Items {
+			var _ appsv1.ReplicaSet = rs
+			if podTemplateUsesSecret(rs.Spec.Template, secret.Name) {
+				replicaSets[rs.Name] = true
+				depName := extractDeploymentName(rs.Name)
+				if depName != "" {
+					deployments[depName] = true
+				}
+			}
+		}
+	}
+
+	dsList, err := clientset.AppsV1().DaemonSets(secret.Namespace).List(context.Background(), metav1.ListOptions{})
+	if err == nil {
+		for _, ds := range dsList.Items {
+			var _ appsv1.DaemonSet = ds
+			if podTemplateUsesSecret(ds.Spec.Template, secret.Name) {
+				daemonSets[ds.Name] = true
+			}
+		}
+	}
+
+	if len(deployments) == 0 && len(replicaSets) == 0 && len(daemonSets) == 0 {
+		fmt.Println("  No deployments, replicasets, or daemonsets use this secret.")
+	} else {
+		if len(deployments) > 0 {
+			fmt.Println("  Used by Deployments:")
+			for dep := range deployments {
+				fmt.Printf("    - %s/%s\n", secret.Namespace, dep)
+			}
+		}
+		if len(replicaSets) > 0 {
+			fmt.Println("  Used by ReplicaSets:")
+			for rs := range replicaSets {
+				fmt.Printf("    - %s/%s\n", secret.Namespace, rs)
+			}
+		}
+		if len(daemonSets) > 0 {
+			fmt.Println("  Used by DaemonSets:")
+			for ds := range daemonSets {
+				fmt.Printf("    - %s/%s\n", secret.Namespace, ds)
+			}
 		}
 	}
 
 	return nil
 }
 
-// Detect if a pod uses a secret
 func podUsesSecret(pod *v1.Pod, secretName string) bool {
 	for _, vol := range pod.Spec.Volumes {
 		if vol.Secret != nil && vol.Secret.SecretName == secretName {
@@ -156,30 +176,19 @@ func podUsesSecret(pod *v1.Pod, secretName string) bool {
 	return false
 }
 
-// Extract Deployment name from ReplicaSet name
+func podTemplateUsesSecret(podTemplate v1.PodTemplateSpec, secretName string) bool {
+	for _, vol := range podTemplate.Spec.Volumes {
+		if vol.Secret != nil && vol.Secret.SecretName == secretName {
+			return true
+		}
+	}
+	return false
+}
+
 func extractDeploymentName(rsName string) string {
 	parts := strings.Split(rsName, "-")
 	if len(parts) < 2 {
 		return ""
 	}
 	return strings.Join(parts[:len(parts)-1], "-")
-}
-
-// Rollout restart a deployment
-func rolloutRestartDeployment(clientset *kubernetes.Clientset, namespace, deploymentName string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		depClient := clientset.AppsV1().Deployments(namespace)
-		dep, err := depClient.Get(context.Background(), deploymentName, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-
-		if dep.Spec.Template.Annotations == nil {
-			dep.Spec.Template.Annotations = map[string]string{}
-		}
-		dep.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339)
-
-		_, err = depClient.Update(context.Background(), dep, metav1.UpdateOptions{})
-		return err
-	})
 }

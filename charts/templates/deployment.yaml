@@ -1,0 +1,21 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secret-checker
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: secret-checker
+  template:
+    metadata:
+      labels:
+        app: secret-checker
+    spec:
+      serviceAccountName: secret-checker-sa
+      containers:
+        - name: secret-checker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}

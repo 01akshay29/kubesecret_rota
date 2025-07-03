@@ -1,29 +1,113 @@
+# Default values for secret-rotator
 replicaCount: 1
 
 image:
-  repository: your-dockerhub-username/secret-watcher
-  tag: latest
-  pullPolicy: IfNotPresent
+  repository: secret-checker
+  tag: "latest"
+  pullPolicy: Always
 
-rbac:
-  create: true
+nameOverride: ""
+fullnameOverride: ""
 
 serviceAccount:
+  # Specifies whether a service account should be created
   create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
   name: ""
 
-resources:
-  limits:
-    cpu: 100m
-    memory: 128Mi
-  requests:
-    cpu: 50m
-    memory: 64Mi
+# RBAC configuration
+rbac:
+  # Specifies whether RBAC resources should be created
+  create: true
+  # Use ClusterRole and ClusterRoleBinding for cluster-wide access
+  clusterWide: true
+  # Additional rules to add to the role
+  additionalRules: []
 
-tolerations:
-  - key: "node-role.kubernetes.io/control-plane"
-    effect: NoSchedule
+# Pod Security Context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  fsGroup: 65534
 
+# Container Security Context
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65534
+
+# Resource limits and requests
+# resources:
+#   limits:
+#     cpu: 500m
+#     memory: 512Mi
+#   requests:
+#     cpu: 100m
+#     memory: 128Mi
+
+# Node selector for pod assignment
 nodeSelector: {}
 
+# Tolerations for pod assignment
+tolerations: []
+
+# Affinity for pod assignment
 affinity: {}
+
+# Pod annotations
+podAnnotations: {}
+
+# Pod labels
+podLabels: {}
+
+# # Liveness probe configuration
+# livenessProbe:
+#   httpGet:
+#     path: /healthz
+#     port: 8080
+#   initialDelaySeconds: 30
+#   periodSeconds: 10
+
+# # Readiness probe configuration
+# readinessProbe:
+#   httpGet:
+#     path: /readyz
+#     port: 8080
+#   initialDelaySeconds: 5
+#   periodSeconds: 5
+
+# Application configuration
+config:
+  # Log level (debug, info, warn, error)
+  logLevel: info
+  # Metrics port
+  metricsPort: 8080
+  # Secret rotation check interval
+  checkInterval: "5m"
+  # Dry run mode - if true, won't actually rotate secrets
+  dryRun: false
+  # Namespaces to monitor (empty means all namespaces)
+  watchNamespaces: []
+
+# Service configuration for metrics
+service:
+  enabled: false
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
+  annotations: {}
+
+# ServiceMonitor for Prometheus monitoring
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}

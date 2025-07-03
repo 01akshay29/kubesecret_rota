@@ -1,0 +1,60 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: secret-rotator
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "daemonsets", "statefulsets", "replicasets"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+# Source: secret-rotator/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: secret-rotator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: release-name-secret-rotator
+subjects:
+  - kind: ServiceAccount
+    name: secret-rotator-sa
+    namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secret-checker
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: secret-checker
+  template:
+    metadata:
+      labels:
+        app: secret-checker
+    spec:
+      serviceAccountName: secret-checker-sa
+      containers:
+        - name: secret-checker
+          image: "secret-checker:latest"
+          imagePullPolicy: Always
+
